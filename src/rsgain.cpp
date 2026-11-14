@@ -74,6 +74,7 @@ static void version();
 static inline void help_custom();
 
 int quiet = 0;
+int warn_stderr = 0; // -O keeps stdout for the table, so warnings go to stderr
 
 #ifdef _WIN32
 BOOL initial_cursor_visibility;
@@ -180,6 +181,7 @@ static void custom_mode(int argc, char *argv[])
 {
     int rc, i;
     unsigned int nb_files   = 0;
+    bool explicit_quiet = false;
     opterr = 0;
 
     const char *short_opts = "+aec:m:tdl:O::qps:LSI:o:h?";
@@ -281,6 +283,7 @@ static void custom_mode(int argc, char *argv[])
 
             case 'q':
                 quiet = 1;
+                explicit_quiet = true;
                 break;
 
             case 'p':
@@ -320,6 +323,7 @@ static void custom_mode(int argc, char *argv[])
                 quit(EXIT_FAILURE);
         }
     }
+    warn_stderr = config.tab_output == OutputType::STDOUT && !explicit_quiet;
 
     nb_files = (unsigned int) (argc - optind);
     if (!nb_files) {

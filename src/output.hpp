@@ -99,8 +99,9 @@ constexpr auto print(std::FILE* stream, fmt::format_string<Args...> fmt, Args&&.
 #define FAIL_PREFIX "[" COLOR_RED FAIL_CHAR COLOR_OFF "] "
 
 extern int quiet;
+extern int warn_stderr;
 #define output_ok(format, ...)    if (!quiet) rsgain::print(OK_PREFIX format "\n" __VA_OPT__(,) __VA_ARGS__)
-#define output_warn(format, ...)  if (!quiet) rsgain::print(WARN_PREFIX format "\n" __VA_OPT__(,) __VA_ARGS__)
+#define output_warn(format, ...)  if (!quiet || warn_stderr) rsgain::print(quiet ? stderr : stdout, WARN_PREFIX format "\n" __VA_OPT__(,) __VA_ARGS__)
 #define output_error(format, ...) rsgain::print(stderr, ERROR_PREFIX format "\n" __VA_OPT__(,) __VA_ARGS__)
 #define output_fail(format, ...)  rsgain::print(stderr, FAIL_PREFIX format "\n" __VA_OPT__(,) __VA_ARGS__)
 

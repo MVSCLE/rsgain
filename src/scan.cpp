@@ -385,7 +385,7 @@ ScanReturn ScanJob::Track::scan(const Config &config, std::mutex *m)
         dp.stream_id = av_find_best_stream(dp.format_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &dp.codec, 0);
         if (dp.stream_id < 0) {
             if (!multithread)
-                output_warn("Could not find audio stream\n");
+                output_warn("Could not find audio stream in '{}'", path.string());
             return ScanReturn::NO_STREAM;
         }
         dp.stream = dp.format_ctx->streams[dp.stream_id];
