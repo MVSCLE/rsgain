@@ -277,62 +277,111 @@ ScanReturn ScanJob::Track::scan_loop(DecoderParams &dp,  ProgressBar *progress_b
         return ScanReturn::ERR;
     }
 
-    while (av_read_frame(dp.format_ctx, packet.get()) == 0) {
-        if (packet->stream_index == dp.stream_id) {
-            if ((rc = avcodec_send_packet(dp.codec_ctx, packet.get())) == 0) {
-                while ((rc = avcodec_receive_frame(dp.codec_ctx, frame.get())) >= 0) {
+    // Damage that still lets the scan finish, reported once at the end
+    size_t bad_packets = 0;
+    size_t skipped_frames = 0;
+
+    // The converter and the meter were set up for this layout; a frame that
+    // differs would be read past its buffers
+    const int in_format = dp.codec_ctx->sample_fmt;
+
+    // Send one decoded frame to the loudness meter; false on a fatal error
+    auto process_frame = [&]() -> bool {
 #if OLD_CHANNEL_LAYOUT
-                    if (frame->channels == dp.nb_channels) {
+        if (frame->channels != dp.nb_channels || frame->format != in_format) {
 #else
-                    if (frame->ch_layout.nb_channels == dp.nb_channels) {
+        if (frame->ch_layout.nb_channels != dp.nb_channels || frame->format != in_format) {
 #endif
-                        // Convert audio format with libswresample if necessary
-                        if (dp.swr) {
-                            size_t out_size = static_cast<size_t>(
-                                av_samples_get_buffer_size(nullptr,
-                                    dp.nb_channels,
-                                    frame->nb_samples,
-                                    dp.output_format,
-                                    0
-                                )
-                            );
-                            if (out_size < 0) {
-                                output_error("Could not calculate output buffer size");
-                                return ScanReturn::ERR;
-                            }
-                            if (out_size > buffer_size) {
-                                buffer = std::make_unique_for_overwrite<uint8_t[]>(out_size);
-                                buffer_size = out_size;
-                                swr_out_data[0] = buffer.get();
-                            }
-                            if (swr_convert(dp.swr, swr_out_data, frame->nb_samples, (const uint8_t**) frame->data, frame->nb_samples) < 0) {
-                                if (!multithread)
-                                    output_error("Could not convert audio frame");
-                                return ScanReturn::ERR;
-                            }
-                            ebur128_add_frames(ebur128.get(), reinterpret_cast<T*>(swr_out_data[0]), static_cast<size_t>(frame->nb_samples));
-                        }
+            skipped_frames++;
+            return true;
+        }
+        uint8_t *data = frame->data[0];
+        int nb_samples = frame->nb_samples;
 
-                        // Audio is already in correct format
-                        else
-                            ebur128_add_frames(ebur128.get(), reinterpret_cast<T*>(frame->data[0]), static_cast<size_t>(frame->nb_samples));
-
-                        if (progress_bar) {
-                            int pos = (int) std::round((double) frame->pts * dp.time_base);
-                            if (pos >= 0)
-                                progress_bar->update(pos);
-                        }
-                    }
-                    av_frame_unref(frame.get());
-                }
+        // Convert audio format with libswresample if necessary
+        if (dp.swr) {
+            int out_size = av_samples_get_buffer_size(nullptr,
+                dp.nb_channels,
+                frame->nb_samples,
+                dp.output_format,
+                0
+            );
+            if (out_size < 0) {
+                if (!multithread)
+                    output_error("Could not calculate output buffer size");
+                return false;
             }
+            if (static_cast<size_t>(out_size) > buffer_size) {
+                buffer = std::make_unique_for_overwrite<uint8_t[]>(out_size);
+                buffer_size = static_cast<size_t>(out_size);
+                swr_out_data[0] = buffer.get();
+            }
+            nb_samples = swr_convert(dp.swr, swr_out_data, frame->nb_samples, (const uint8_t**) frame->data, frame->nb_samples);
+            if (nb_samples < 0) {
+                if (!multithread)
+                    output_error("Could not convert audio frame");
+                return false;
+            }
+            data = swr_out_data[0];
+        }
+
+        if (ebur128_add_frames(ebur128.get(), reinterpret_cast<T*>(data), static_cast<size_t>(nb_samples)) != EBUR128_SUCCESS) {
+            if (!multithread)
+                output_error("Could not analyze audio frame");
+            return false;
+        }
+
+        if (progress_bar) {
+            int pos = (int) std::round((double) frame->pts * dp.time_base);
+            if (pos >= 0)
+                progress_bar->update(pos);
+        }
+        return true;
+    };
+
+    // Drain every frame the decoder has ready; false on a fatal error
+    auto receive_frames = [&]() -> bool {
+        int ret;
+        while ((ret = avcodec_receive_frame(dp.codec_ctx, frame.get())) >= 0) {
+            bool ok = process_frame();
+            av_frame_unref(frame.get());
+            if (!ok)
+                return false;
+        }
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+            bad_packets++;
+        return true;
+    };
+
+    while ((rc = av_read_frame(dp.format_ctx, packet.get())) == 0) {
+        if (packet->stream_index == dp.stream_id) {
+            if (avcodec_send_packet(dp.codec_ctx, packet.get()) < 0)
+                bad_packets++;
+            if (!receive_frames())
+                return ScanReturn::ERR;
         }
         av_packet_unref(packet.get());
     }
+    bool read_error = rc != AVERROR_EOF;
+
+    // Flush the frames the decoder still holds
+    if (avcodec_send_packet(dp.codec_ctx, nullptr) == 0 && !receive_frames())
+        return ScanReturn::ERR;
 
     // Make sure the progress bar finishes at 100%
     if (progress_bar)
         progress_bar->complete();
+
+    if (!multithread) {
+        if (read_error)
+            output_warn("Read error in '{}', only the audio before it was scanned", path.string());
+        if (bad_packets)
+            output_warn("{} {} in '{}' could not be decoded and {} skipped", bad_packets,
+                bad_packets > 1 ? "packets" : "packet", path.string(), bad_packets > 1 ? "were" : "was");
+        if (skipped_frames)
+            output_warn("{} {} in '{}' changed channel count or sample format and {} skipped", skipped_frames,
+                skipped_frames > 1 ? "frames" : "frame", path.string(), skipped_frames > 1 ? "were" : "was");
+    }
 
     return ScanReturn::SUCCESS;
 }
